@@ -1,3 +1,4 @@
+import base64
 import copy
 import html
 import importlib.util
@@ -18,12 +19,15 @@ from streamlit_folium import st_folium
 # ==========================================
 # PAGE CONFIGURATION & STYLING
 # ==========================================
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+
 st.set_page_config(
-    page_title="Corpus2GeoRAG: Pacific Theater (WWII) 🌊",
-    page_icon="🌊",
+    page_title="Corpus2GeoRAG: Pacific Theater (WWII)",
+    page_icon=ASSETS_DIR / "logo_icon.svg",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+st.logo(str(ASSETS_DIR / "logo_lockup.svg"), icon_image=str(ASSETS_DIR / "logo_mark.svg"), size="large")
 
 # Custom CSS matching the presentation's dark starry & sleek aesthetic.
 # Static only: no data is ever inserted into an unsafe_allow_html block.
@@ -35,21 +39,44 @@ st.markdown("""
         color: #E0E6ED;
     }
 
-    /* Main header */
+    /* Less empty space above the header */
+    .block-container {
+        padding-top: 4.5rem;  /* clears Streamlit's 3.75rem top bar so the logo isn't cut */
+    }
+
+    /* Main header: logo beside the title, one compact row */
+    .main-header {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.8rem;
+    }
+
     .main-title {
-        font-size: 2.2rem;
+        font-size: 1.9rem;
         font-weight: 700;
         color: #FFFFFF;
-        text-align: center;
-        margin-bottom: 0.2rem;
         letter-spacing: 1px;
     }
 
     .subtitle {
-        font-size: 1.05rem;
+        font-size: 0.9rem;
         color: #94A3B8;
         text-align: center;
-        margin-bottom: 1.5rem;
+        margin-bottom: 0.1rem;
+    }
+
+    /* Top bar: centered and narrower than the page */
+    .st-key-top_bar {
+        max-width: 960px;
+        margin: 0 auto;
+    }
+
+    .pipeline-line {
+        font-size: 0.8rem;
+        color: #94A3B8;
+        text-align: center;
+        margin-bottom: 0.5rem;
     }
 
     /* Custom button styling */
@@ -82,8 +109,8 @@ POLL_INTERVAL_S = 0.2
 DEFAULT_CENTER = [15.0, 150.0]
 DEFAULT_ZOOM = 3
 
-# Suggestions with the real agent. In mock mode the buttons come from the agent's recorded
-# questions instead (Agent/geo_agent/mock_fixtures/*.json), so every one has a reply.
+# The same buttons with the real agent and in mock mode: each question has a recorded
+# reply in Agent/geo_agent/mock_fixtures/*.json, so the demo answers every one.
 SUGGESTED_QUESTIONS = [
     ("📍 Where was the Battle of Midway?", "Where did the Battle of Midway happen?"),
     ("⚔️ Who attacked Guadalcanal in 1942?", "Who attacked Guadalcanal in 1942?"),
@@ -91,10 +118,6 @@ SUGGESTED_QUESTIONS = [
     ("🗺️ Major Pacific battles", "Show me major battles in the Pacific War on the map"),
 ]
 SUGGESTIONS_PER_ROW = 4
-
-# Button icon by the fixture file's prefix (answer_midway.json -> "answer").
-FIXTURE_ICONS = {"answer": "📍", "both": "⚖️", "clarification": "❓", "followup": "↩️", "overview": "🗺️",
-                 "set": "🧭", "off": "🚫", "error": "💥"}
 
 WARNING_LABELS = {
     "low_confidence": "Low confidence",
@@ -392,33 +415,6 @@ def entity_label(res: Dict[str, Any], entity_id: str) -> str:
     return entity_id
 
 
-def _same_question(a: str, b: str) -> bool:
-    return re.sub(r"\W+", " ", a).strip().lower() == re.sub(r"\W+", " ", b).strip().lower()
-
-
-def recorded_questions() -> List[Tuple[str, str]]:
-    """In mock mode: (label, question) for every recorded question in Agent/geo_agent/mock_fixtures.
-
-    The mock loaded those JSON files (key -> {question, after, reply}). A follow-up such as
-    "Tarawa" only has a reply right after its first question on the same conversation,
-    so it is offered only then. Empty outside mock mode.
-    """
-    fixtures = getattr(runner.agent, "fixtures", None) if runner is not None and agent["mode"] == "mock" else None
-    if not isinstance(fixtures, dict):
-        return []
-    last_user = next((m["content"] for m in reversed(st.session_state.messages) if m["role"] == "user"), "")
-    out = []
-    for key, fx in fixtures.items():
-        question = fx.get("question")
-        if not question:
-            continue
-        parent = fixtures.get(fx.get("after")) if fx.get("after") else None
-        if fx.get("after") and not (parent and _same_question(last_user, parent.get("question", ""))):
-            continue
-        out.append((f"{FIXTURE_ICONS.get(key.split('_')[0], '💬')} {question}", question))
-    return out
-
-
 def render_entity_card(entity_id: str):
     """Details of one entity from the loaded graph. The excerpt is source text: shown as plain text."""
     card = runner.get_entity_feature(entity_id) if runner else None
@@ -547,82 +543,41 @@ busy = st.session_state.pending is not None or (runner is not None and runner.is
 # ==========================================
 # MAIN PAGE HEADER
 # ==========================================
-st.markdown('<div class="main-title">Corpus2GeoRAG: Pacific Theater (WWII) 🌊</div>', unsafe_allow_html=True)
+_LOGO_B64 = base64.b64encode((ASSETS_DIR / "logo_mark.svg").read_bytes()).decode("ascii")
+st.markdown(f'<div class="main-header"><img src="data:image/svg+xml;base64,{_LOGO_B64}" alt="" width="60" height="60">'
+            '<span class="main-title">Pacific Theater (WWII)</span></div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">Transforms unstructured Wikipedia Pacific War corpora into a geographically-aware knowledge graph and interactive GeoRAG exploration</div>', unsafe_allow_html=True)
 
 # ==========================================
-# TOP BAR: MAP CONFIGURATION, AGENT STATUS & GRAPH STATS
+# AGENT STATUS: shown only when something is broken (agent unavailable, failed health check).
+# Mock mode looks the same as the real agent; the chat only notes it in one line.
 # ==========================================
-with st.container(border=True):
-    col_cfg, col_agent, col_stats, col_actions = st.columns([2, 4, 3, 2])
+tile_choice = "OpenStreetMap (Standard)"
 
-    with col_cfg:
-        st.markdown("**⚙️ Map theme**")
-        tile_choice = st.selectbox(
-            "Map Theme:",
-            [
-                "OpenStreetMap (Standard)",
-                "CartoDB Positron (Minimal)",
-                "CartoDB Dark Matter (Dark)"
-            ],
-            index=0,
-            label_visibility="collapsed",
-        )
-
-    with col_agent:
-        st.markdown("**🤖 Agent engine**")
-        health = runner.health() if runner else {}
-        if agent["mode"] == "agent":
-            if health.get("ok"):
-                st.success("🟢 GeoRAG Agent connected")
-            else:
+health = runner.health() if runner else {}
+if agent["mode"] == "unavailable" or (agent["mode"] == "agent" and not health.get("ok")):
+    with st.container(border=True, key="top_bar"):
+        col_status, col_retry = st.columns([6, 2])
+        with col_status:
+            if agent["mode"] == "agent":
                 st.warning("🟠 GeoRAG Agent loaded, but its health check failed")
-        elif agent["mode"] == "mock":
-            st.warning("🟠 Mock mode — recorded demo replies on the sample graph, no model calls.")
-        else:
-            st.error("🔴 Agent unavailable — questions can't be answered.")
-        if agent["reason"]:
-            st.caption(f"Reason: {md_text(agent['reason'])}")
-        if health:
-            st.caption(f"Model: `{md_text(health.get('model') or '—')}` · agent {md_text(health.get('version') or '?')}"
-                       f" · schema {md_text(health.get('schema_version') or '?')}")
+            else:
+                st.error("🔴 Agent unavailable — questions can't be answered.")
+            if agent["reason"]:
+                st.caption(f"Reason: {md_text(agent['reason'])}")
+        with col_retry:
+            if agent["mode"] != "agent":
+                if st.button("🔌 Retry Agent", use_container_width=True, disabled=busy):
+                    if runner is not None:
+                        runner.close()
+                    load_agent.clear()
+                    st.rerun()
 
-    with col_stats:
-        st.markdown("**📊 Knowledge graph**")
-        if runner is not None:
-            stats = runner.stats()
-            col_g1, col_g2, col_g3 = st.columns(3)
-            col_g1.metric("Entities", f"{stats['nodes']:,}")
-            col_g2.metric("Relations", f"{stats['edges']:,}")
-            col_g3.metric("Geocoded", f"{stats['geocoded']:,}")
-            with st.expander("Entity types"):
-                st.json(stats["node_types"])
-        else:
-            st.caption("No graph loaded.")
+st.markdown('<div class="pipeline-line">Pipeline: Pacific Wikipedia Corpus → NER → Geocoding → KG → Agentic RAG → Folium</div>',
+            unsafe_allow_html=True)
 
-    with col_actions:
-        st.markdown("**🔧 Actions**")
-        if st.button("🔄 New conversation", use_container_width=True):
-            reset_conversation()
-            st.rerun()
-        if agent["mode"] != "agent":
-            if st.button("🔌 Retry Agent", use_container_width=True, disabled=busy):
-                if runner is not None:
-                    runner.close()
-                load_agent.clear()
-                st.rerun()
-
-    st.caption("Pipeline: `Pacific Wikipedia Corpus → NER → Geocoding → KG → Agentic RAG → Folium`")
-
-recorded = recorded_questions()
-if recorded:
-    st.markdown("##### 🧪 Recorded demo questions (mock mode):")
-    st.caption("Questions and answers from the agent's `Agent/geo_agent/mock_fixtures` JSON files. "
-               "Any other question gets a \"no recorded reply\" message.")
-    suggestions = recorded
-else:
-    st.markdown("##### 💡 Suggested questions:")
-    suggestions = SUGGESTED_QUESTIONS
+st.markdown("##### 💡 Suggested questions:")
+suggestions = SUGGESTED_QUESTIONS
 
 for row_start in range(0, len(suggestions), SUGGESTIONS_PER_ROW):
     row = suggestions[row_start:row_start + SUGGESTIONS_PER_ROW]
@@ -633,12 +588,12 @@ for row_start in range(0, len(suggestions), SUGGESTIONS_PER_ROW):
                 submit_question(question)
 
 # ==========================================
-# CHAT (LEFT) & INTERACTIVE FOLIUM MAP (RIGHT)
+# INTERACTIVE FOLIUM MAP (LEFT) & CHAT (RIGHT)
 # ==========================================
-MAP_HEIGHT = 530
-CHAT_HEIGHT = MAP_HEIGHT - 70  # leaves room for the input box under the messages
+MAP_HEIGHT = 720
+CHAT_HEIGHT = MAP_HEIGHT - 240  # leaves room for the chat heading, the input box and the New chat button
 
-col_chat, col_map = st.columns([5, 7])
+col_map, col_chat = st.columns([8, 4])
 
 with col_chat:
     st.markdown("#### 💬 Ask the GeoAI Agent")
@@ -646,6 +601,8 @@ with col_chat:
     with chat_box:
         if not st.session_state.messages:
             st.caption("Ask a question in English below or pick a suggestion. Answers appear here, and their places on the map.")
+            if agent["mode"] == "mock":
+                st.caption("Demo mode: recorded answers to the suggested questions.")
         # Message history: user text and agent answers are rendered as Markdown, never as raw HTML
         for msg in st.session_state.messages[-20:]:
             if msg["role"] == "user":
@@ -656,14 +613,16 @@ with col_chat:
                     render_reply(msg.get("data") or {})
 
     user_input = st.chat_input(
-        "Ask in English about World War II... (e.g., 'Where did the Battle of Midway happen?')",
+        "Ask anything...",
         disabled=busy or runner is None,
     )
     if user_input:
         submit_question(user_input)
+    if st.button("New chat", help="Start a new conversation", use_container_width=True):
+        reset_conversation()
+        st.rerun()
 
 with col_map:
-    st.markdown("#### 🗺️ Interactive Geospatial Knowledge Map")
     folium_map_obj = render_agent_map(st.session_state.map_reply, tile_theme=tile_choice)
     map_state = st_folium(folium_map_obj, width="100%", height=MAP_HEIGHT, key="agent_map",
                           returned_objects=["last_active_drawing"])

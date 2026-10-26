@@ -730,3 +730,85 @@ def test_answer_with_nothing_to_draw_is_flagged():
     out = finalize_answer(STORE, AgentAnswer(answer="Isoroku Yamamoto commanded the Combined Fleet.", answer_ids=["per:yamamoto"],
                                              context_ids=[], sources=[], answer_sets=[]), turn_)
     assert out["geojson"]["features"] == [] and "nothing_on_map" in out["warnings"]
+
+
+# Nicknames in the answer path (spec R53, R55, plan step 26)
+
+def _resolve(question, query, kept, answer_ids=None):
+    parsed = AgentAnswer(answer="x", answer_ids=answer_ids or kept, context_ids=[], sources=[], answer_sets=[])
+    return finalize_answer(STORE, parsed, search_turn(question, query))
+
+
+def test_model_reading_is_shown_when_the_graph_doesnt_link_the_users_words():
+    out = _resolve("Where did the Leathernecks fight?", "United States Marine Corps", ["org:usmc"])
+    assert any("the model's reading" in line and "United States Marine Corps" in line for line in out["interpretation"])
+    linked = _resolve("Where did the Old Breed fight?", "1st Marine Division", ["org:1st_marine_division"])
+    assert not any("the model's reading" in line for line in linked["interpretation"])  # the graph holds "The Old Breed"
+
+
+def test_nickname_interpretation_cites_the_graph_evidence():
+    out = _resolve("Who attacked Cactus in 1942?", "Cactus", ["loc:guadalcanal"])
+    assert any(line.startswith("'Cactus' read as Guadalcanal (nickname") and 'codename was "Cactus"' in line
+               for line in out["interpretation"])
+
+
+def test_year_outside_a_ships_service_is_a_context_mismatch():
+    late = _resolve("Where did the Big E fight in 1945?", "Big E", ["ship:enterprise_cvn65"])
+    assert "context_mismatch" in late["warnings"]
+    ok = _resolve("Where did the Big E fight in 1942?", "Big E", ["ship:enterprise_cv6"])
+    assert "context_mismatch" not in ok["warnings"]
+
+
+def test_r24a_prompt_puts_the_place_first():
+    assert "Location first" in agent_mod.SYSTEM_PROMPT and "the PLACE goes in answer_ids" in agent_mod.SYSTEM_PROMPT
+
+
+def test_r24a_named_place_moves_to_the_answer_when_the_answer_is_events():
+    turn_ = search_turn("What happened in Tokyo during the war?", "Tokyo")
+    parsed = AgentAnswer(answer="The Doolittle Raid.", answer_ids=["event:doolittle_raid"], context_ids=["loc:tokyo"],
+                         sources=[], answer_sets=[])
+    out = finalize_answer(STORE, parsed, turn_)
+    assert out["answer_ids"][0] == "loc:tokyo" and "event:doolittle_raid" in out["answer_ids"]
+    assert "loc:tokyo" not in out["context_ids"]
+    who = finalize_answer(STORE, AgentAnswer(answer="The USMC.", answer_ids=["org:usmc"], context_ids=["loc:guadalcanal"],
+                                             sources=[], answer_sets=[]), search_turn("Who attacked Guadalcanal?", "Guadalcanal", "United States Marine Corps"))
+    assert who["answer_ids"] == ["org:usmc"]  # a "who" answer keeps its attackers as the answer
+
+
+# Outside facts in "not in the graph" replies (user decision 2026-10-19, option b)
+
+KNOWN = ("Where did the Big Red One fight? 1st Infantry Division PART_OF United States Army "
+         "the Pacific theatre of World War II")
+
+
+def test_outside_names_finds_what_neither_question_nor_tools_said():
+    reply = ("The \"Big Red One\" (1st Infantry Division) is in the graph, but no battles are recorded. This is likely "
+             "because it fought primarily in the European theatre (North Africa, Sicily, Normandy, the Bulge, etc.), "
+             "outside the scope of this Pacific theatre of World War II graph. However, the United States Army is recorded.")
+    assert agent_mod.outside_names(reply, KNOWN) == ["European", "North Africa", "Sicily", "Normandy", "Bulge"]
+
+
+def test_outside_names_ignores_grounded_and_common_words():
+    reply = ("I couldn't find any entity called \"Purple Thunder Brigade\" in the knowledge graph. However, the graph "
+             "covers the Pacific theatre of World War II; in June 1942 the Japanese and the Allies fought at Midway.")
+    known = "Where did the Purple Thunder Brigade fight in 1943? the Pacific theatre of World War II Battle of Midway"
+    assert agent_mod.outside_names(reply, known) == []
+
+
+def test_no_answer_reply_with_outside_facts_is_flagged():
+    turn_ = search_turn("Where did the Big Red One fight?", "Big Red One")
+    reply = "The graph records the 1st Infantry Division but no battles; it fought at Normandy."
+    out = finalize_answer(STORE, AgentAnswer(answer=reply, answer_ids=[], context_ids=["org:1st_infantry_division"],
+                                             sources=[], answer_sets=[]), turn_)
+    assert out["ungrounded_names"] == ["Normandy"] and "ungrounded_names" in out["warnings"]
+
+
+def test_r24a_place_found_by_another_tool_still_moves_to_the_answer():
+    """'What happened at Darwin in 1942?': the model searched 'Bombing of Darwin'; Darwin came from get_locations."""
+    t = {x.name: x for x in build_tools(STORE)}
+    turn_ = search_turn("What happened at Darwin in 1942?", "Bombing of Darwin") + [
+        msg("ai", tool_calls=[{"name": "get_locations", "args": {"entity_id": "event:bombing_of_darwin"}, "id": "g"}]),
+        msg("tool", t["get_locations"].invoke({"entity_id": "event:bombing_of_darwin"}), name="get_locations")]
+    out = finalize_answer(STORE, AgentAnswer(answer="The Bombing of Darwin.", answer_ids=["event:bombing_of_darwin"],
+                                             context_ids=["loc:darwin"], sources=[], answer_sets=[]), turn_)
+    assert out["answer_ids"][0] == "loc:darwin"
